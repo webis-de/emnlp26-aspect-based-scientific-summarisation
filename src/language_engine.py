@@ -1,0 +1,587 @@
+"""Language engine wrapper for vLLM-based text and structured generation.
+
+Provides a `LanguageEngine` class that initializes a vLLM model and tokenizer,
+and exposes helpers for single/batch responses, including JSON-schema (Pydantic)
+constrained outputs that are constructed as Pydantic model instances. The
+module also includes a runnable example section demonstrating typical usage
+patterns.
+"""
+
+from vllm import LLM, SamplingParams
+from transformers import AutoConfig, AutoTokenizer
+from vllm.sampling_params import StructuredOutputsParams
+from pydantic import BaseModel
+
+VLLM_CONFIG = {
+    "model_path": "Qwen/Qwen3.5-9B",        # "HuggingFaceTB/SmolLM2-1.7B-Instruct" or "Qwen3-4B" or "Qwen3-4B-Instruct-2507" or "Qwen/Qwen3-0.6B" or "Qwen/Qwen3-8B" or any other vLLM-compatible model
+    "max_model_len": None,                  # Optional: specify max model length if known, else inferred
+    "tensor_parallel_size": 1,              # Use >1 for multi-GPU inference
+    "gpu_memory_utilization": 0.90,         # Fraction of GPU memory to use (e.g., 0.90 for 90%)
+    "dtype": "bfloat16",                    # "float16" or "bfloat16"
+    "quantization": None,                   # vLLM quantization mode, e.g. "awq", or None
+    "kv_cache_dtype": "auto",               # KV cache dtype, e.g. "fp8" or "auto"
+    "temperature": 0.1,                     # Sampling temperature
+    "top_p": 0.95,                          # Nucleus sampling top-p
+    "max_tokens": int(8 * 2048),            # Maximum tokens to generate
+}
+
+class LanguageEngine:
+    """Language engine constructed around vLLM for simple and structured generations.
+
+    This class initializes a vLLM model and tokenizer, and exposes helpers for
+    single/batch generation, including constrained outputs that are
+    used to construct Pydantic model instances, with optional "thinking" mode.
+    """
+
+    def __init__(self, config=None):
+        """Initialize the language engine and load model/tokenizer.
+
+        Args:
+            config (dict): vLLM and sampling configuration. Expected keys
+                include `model_path`, `tensor_parallel_size`,
+                `gpu_memory_utilization`, `max_model_len`, `dtype`,
+                `temperature`, `top_p`, `max_tokens`, and optionally `yarn_rope_scaling` and `yarn_factor`.
+
+        Side Effects:
+            Loads the model weights and tokenizer into memory and prepares
+            default sampling parameters.
+        """
+        self.config = {**VLLM_CONFIG, **(config or {})}
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config["model_path"],
+            trust_remote_code=True
+        )
+
+        model_org_config = AutoConfig.from_pretrained(self.config["model_path"], trust_remote_code=True)
+        print(f"Original model config loaded for {self.config['model_path']}: {model_org_config}")
+
+        # Infer max_model_len from the model config when it is not provided.
+        if self.config["max_model_len"] is None:
+            max_model_len = getattr(model_org_config, "max_position_embeddings", None)
+            if max_model_len is None:
+                text_config = getattr(model_org_config, "text_config", None)
+                max_model_len = getattr(text_config, "max_position_embeddings", None)
+            if max_model_len is None:
+                raise ValueError(
+                    "Unable to infer max_model_len from model config; set it explicitly."
+                )
+            self.config["max_model_len"] = max_model_len
+            print(f"Inferred max_model_len from model config: {max_model_len} tokens")
+
+        self.model = LLM(
+            model=self.config["model_path"],
+            tensor_parallel_size=self.config["tensor_parallel_size"],
+            gpu_memory_utilization=self.config["gpu_memory_utilization"],
+            max_model_len=self.config["max_model_len"],
+            dtype=self.config["dtype"],
+            trust_remote_code=True,
+            enforce_eager=True,
+        )
+        
+        self.sampling_params = SamplingParams(
+            temperature=self.config["temperature"],
+            top_p=self.config["top_p"],
+            max_tokens=self.config["max_tokens"]
+        )
+
+    def generate(self, user_prompt, enable_thinking=False, system_prompt=None):
+        """Generate a response for a single user prompt.
+
+        Args:
+            user_prompt (str): The user message to send to the model.
+            enable_thinking (bool): Whether to enable the model's thinking
+                mode in the chat template.
+            system_prompt (str | None): Optional system message to prepend.
+
+        Returns:
+            str: The model's response text (stripped).
+        """
+        # PROMPT CONSTRUCTION
+        messages = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        
+        full_prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+        )
+        
+        # INFERENCE
+        outputs = self.model.generate([full_prompt], self.sampling_params, use_tqdm=False)
+        
+        # Clean Output
+        raw_text = outputs[0].outputs[0].text.strip()
+
+        return raw_text
+    
+    def generate_in_batch(self, user_prompts, enable_thinking=False, system_prompt=None):
+        """Generate responses for a batch of user prompts.
+
+        Args:
+            user_prompts (list[str]): A list of user messages.
+            enable_thinking (bool): Whether to enable thinking mode in the
+                chat template.
+            system_prompt (str | None): Optional system message to prepend.
+
+        Returns:
+            list[str]: A list of response texts aligned with inputs.
+        """
+        full_prompts = []
+        for user_prompt in user_prompts:
+            messages = []
+            if system_prompt is not None:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": user_prompt})
+
+            full_prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+            )
+            full_prompts.append(full_prompt)
+
+        outputs = self.model.generate(full_prompts, self.sampling_params, use_tqdm=False)
+
+        results = []
+        for output in outputs:
+            raw_text = output.outputs[0].text.strip()
+            results.append(raw_text)
+
+        return results
+    
+    def generate_structured(self, user_prompt, pydantic_model, enable_thinking=False, system_prompt=None):
+        """Generate a JSON response and construct a Pydantic model.
+
+        Args:
+            user_prompt (str): The user message to send to the model.
+            pydantic_model (type[BaseModel]): Pydantic model class used to
+                derive the JSON schema and validate the output.
+            enable_thinking (bool): Whether to enable the model's thinking
+                mode before structured generation.
+            system_prompt (str | None): Optional system message to prepend.
+
+        Returns:
+            BaseModel: An instance of `pydantic_model` constructed from the
+                generated JSON.
+        """
+        raw_result = self.__generate_structured(
+            user_prompt,
+            pydantic_model.model_json_schema(),
+            enable_thinking,
+            system_prompt,
+        )
+        try:
+            return pydantic_model.model_validate_json(raw_result)
+        except Exception as exc:
+            print("Structured parse failed for single prompt.")
+            print(f"Error: {exc}")
+            print("Prompt:")
+            print(user_prompt)
+            print("Raw output:")
+            print(raw_result)
+            return None
+
+    def generate_structured_in_batch(self, user_prompts, pydantic_model, enable_thinking=False, system_prompt=None):
+        """Generate structured JSON responses and construct models in batch.
+
+        Args:
+            user_prompts (list[str]): A list of user messages.
+            pydantic_model (type[BaseModel]): Pydantic model class used to
+                derive the JSON schema and validate all outputs.
+            enable_thinking (bool): Whether to enable the model's thinking
+                mode before structured generation.
+            system_prompt (str | None): Optional system message to prepend.
+
+        Returns:
+            list[BaseModel]: List of pydantic model instances constructed from the
+                generated JSON outputs.
+        """
+        json_schema = pydantic_model.model_json_schema()
+        raw_results = self.__generate_structured_in_batch(user_prompts, json_schema, enable_thinking, system_prompt)
+        outputs = []
+        for idx, result in enumerate(raw_results):
+            try:
+                outputs.append(pydantic_model.model_validate_json(result))
+            except Exception as exc:
+                print("Structured parse failed in batch.")
+                print(f"Index: {idx}")
+                print(f"Error: {exc}")
+                print("Prompt:")
+                print(user_prompts[idx])
+                print("Raw output:")
+                print(result)
+                outputs.append(None)
+        return outputs
+
+    def generate_structured_in_batch_with_token_metadata(self, user_prompts, pydantic_model, enable_thinking=False, system_prompt=None):
+        """Like generate_structured_in_batch but also returns per-sample token metadata.
+
+        Returns:
+            tuple[list[BaseModel | None], list[dict]]: Parsed models and token metadata dicts
+                with keys ``num_rollouts``, ``input_tokens``, ``output_tokens``.
+        """
+        json_schema = pydantic_model.model_json_schema()
+        raw_results, raw_outputs = self.__generate_structured_in_batch_with_raw_outputs(
+            user_prompts,
+            json_schema,
+            enable_thinking,
+            system_prompt,
+        )
+
+        parsed = []
+        token_metadata = []
+        for idx, (result, raw_output) in enumerate(zip(raw_results, raw_outputs)):
+            token_metadata.append(
+                {
+                    "num_rollouts": len(raw_output.outputs),
+                    "input_tokens": len(raw_output.prompt_token_ids),
+                    "output_tokens": len(raw_output.outputs[0].token_ids),
+                }
+            )
+            try:
+                parsed.append(pydantic_model.model_validate_json(result))
+            except Exception as exc:
+                print(f"Structured parse failed in batch. Index: {idx}, Error: {exc}")
+                parsed.append(None)
+        return parsed, token_metadata
+
+    def generate_structured_in_batch_with_models(self, user_prompts, pydantic_models, enable_thinking=False, system_prompt=None):
+        """Generate structured JSON responses and construct per-item models.
+
+        Args:
+            user_prompts (list[str]): A list of user messages.
+            pydantic_models (list[type[BaseModel]]): A list of Pydantic model
+                classes, one per prompt.
+            enable_thinking (bool): Whether to enable the model's thinking
+                mode before structured generation.
+            system_prompt (str | None): Optional system message to prepend.
+
+        Returns:
+            list[BaseModel]: List of pydantic model instances constructed from the
+                generated JSON outputs and aligned with inputs.
+
+        Raises:
+            ValueError: If `user_prompts` and `pydantic_models` differ in
+                length.
+        """
+        if len(user_prompts) != len(pydantic_models):
+            raise ValueError("user_prompts and pydantic_models must have the same length")
+
+        raw_results = self.__generate_structured_in_batch_with_models(
+            user_prompts, pydantic_models, enable_thinking, system_prompt
+        )
+        return [
+            model.model_validate_json(result)
+            for model, result in zip(pydantic_models, raw_results)
+        ]
+
+    def __generate_structured(self, user_prompt, json_schema, enable_thinking=False, system_prompt=None):
+        messages = []
+        if system_prompt is not None:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        # If thinking is enabled, we will need to first generate the reasoning steps
+        if enable_thinking:
+            full_prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            )
+            thinking_outputs = self.model.generate([full_prompt], self.sampling_params, use_tqdm=False)
+            reasoning_steps = thinking_outputs[0].outputs[0].text.strip()
+            reasoning_steps = reasoning_steps.split("</think>")[0].strip() + "</think>"  # Extract the reasoning part and reconstruct
+            full_prompt = full_prompt + reasoning_steps + "\n"
+        else:
+            full_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                continue_final_message=False
+            )
+
+        structured_outputs_params = StructuredOutputsParams(json=json_schema)
+
+        structured_params = SamplingParams(
+            temperature=self.config["temperature"],
+            top_p=self.config["top_p"],
+            max_tokens=self.config["max_tokens"],
+            structured_outputs=structured_outputs_params
+        )
+
+        outputs = self.model.generate([full_prompt], structured_params, use_tqdm=False)
+        raw_text = outputs[0].outputs[0].text.strip()
+        return raw_text
+
+    def __generate_structured_in_batch(self, user_prompts, json_schema, enable_thinking=False, system_prompt=None):
+        results, _ = self.__generate_structured_in_batch_with_raw_outputs(
+            user_prompts,
+            json_schema,
+            enable_thinking,
+            system_prompt,
+        )
+        return results
+
+    def __generate_structured_in_batch_with_raw_outputs(self, user_prompts, json_schema, enable_thinking=False, system_prompt=None):
+        messages_list = []
+        for user_prompt in user_prompts:
+            messages = []
+            if system_prompt is not None:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": user_prompt})
+            messages_list.append(messages)
+
+        if enable_thinking:
+            thinking_prompts = [
+                self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+                )
+                for messages in messages_list
+            ]
+            thinking_outputs = self.model.generate(thinking_prompts, self.sampling_params, use_tqdm=False)
+            reasoning_steps = []
+            for output in thinking_outputs:
+                step = output.outputs[0].text.strip()
+                step = step.split("</think>")[0].strip() + "</think>"
+                reasoning_steps.append(step)
+
+            full_prompts = [
+                prompt + reasoning + "\n"
+                for prompt, reasoning in zip(thinking_prompts, reasoning_steps)
+            ]
+        else:
+            full_prompts = [
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                    continue_final_message=False
+                )
+                for messages in messages_list
+            ]
+
+        structured_outputs_params = StructuredOutputsParams(json=json_schema)
+        structured_params = SamplingParams(
+            temperature=self.config["temperature"],
+            top_p=self.config["top_p"],
+            max_tokens=self.config["max_tokens"],
+            structured_outputs=structured_outputs_params
+        )
+
+        outputs = self.model.generate(full_prompts, structured_params, use_tqdm=False)
+        results = []
+        for output in outputs:
+            raw_text = output.outputs[0].text.strip()
+            results.append(raw_text)
+        return results, outputs
+
+    def __generate_structured_in_batch_with_models(self, user_prompts, pydantic_models, enable_thinking=False, system_prompt=None):
+        messages_list = []
+        for user_prompt in user_prompts:
+            messages = []
+            if system_prompt is not None:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": user_prompt})
+            messages_list.append(messages)
+
+        if enable_thinking:
+            thinking_prompts = [
+                self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+                )
+                for messages in messages_list
+            ]
+            thinking_outputs = self.model.generate(thinking_prompts, self.sampling_params, use_tqdm=False)
+            reasoning_steps = []
+            for output in thinking_outputs:
+                step = output.outputs[0].text.strip()
+                step = step.split("</think>")[0].strip() + "</think>"
+                reasoning_steps.append(step)
+
+            full_prompts = [
+                prompt + reasoning + "\n"
+                for prompt, reasoning in zip(thinking_prompts, reasoning_steps)
+            ]
+        else:
+            full_prompts = [
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                    continue_final_message=False
+                )
+                for messages in messages_list
+            ]
+
+        structured_params_list = []
+        for model in pydantic_models:
+            json_schema = model.model_json_schema()
+            structured_outputs_params = StructuredOutputsParams(json=json_schema)
+            structured_params = SamplingParams(
+                temperature=self.config["temperature"],
+                top_p=self.config["top_p"],
+                max_tokens=self.config["max_tokens"],
+                structured_outputs=structured_outputs_params
+            )
+            structured_params_list.append(structured_params)
+
+        outputs = self.model.generate(full_prompts, structured_params_list, use_tqdm=False)
+        results = []
+        for output in outputs:
+            raw_text = output.outputs[0].text.strip()
+            results.append(raw_text)
+        return results
+
+# Example usage (run this file directly to try the API):
+if __name__ == "__main__":
+    engine = LanguageEngine()
+
+    # 1) Single-prompt text generation (basic chat-style usage).
+    #    Shows the minimal call pattern; use this when you only need one reply.
+    prompt = "Explain the theory of relativity in simple terms."
+    response = engine.generate(prompt)
+    print("Response:", response)
+
+    # 2) Batch text generation to amortize overhead across multiple prompts.
+    #    Shows how to process many prompts at once; use for throughput-sensitive workloads.
+    prompts = ["What is quantum computing?", "Describe the process of photosynthesis."]
+    responses = engine.generate_in_batch(prompts)
+    for i, resp in enumerate(responses):
+        print(f"Response {i+1}:", resp)
+
+    # 3) Structured generation: define a schema with Pydantic and get a model instance back.
+    #    Shows schema-constrained outputs; use when downstream code needs typed fields.
+    class CarDescription(BaseModel):
+        brand: str
+        model: str
+        car_type: str
+
+    structured_prompt = (
+        "Generate a JSON with the brand, model and car_type of the most iconic car from the 90's. Think step by step which was the most iconic car and then provide the answer in JSON format."
+    )
+    structured_response = engine.generate_structured(
+        structured_prompt, pydantic_model=CarDescription, enable_thinking=False
+    )
+    print("Structured Response:", structured_response)
+    print(f"Structured Response Type: {type(structured_response)}")
+
+    # 4) Structured generation with `enable_thinking=True` to allow a reasoning prefix.
+    #    Shows how to enable thinking tokens; use if the model benefits from chain-of-thought.
+    structured_response = engine.generate_structured(
+        structured_prompt, pydantic_model=CarDescription, enable_thinking=True
+    )
+    print("Structured Response:", structured_response)
+    print(f"Structured Response Type: {type(structured_response)}")
+
+    # 5) Batch structured generation with a single shared schema.
+    #    Shows batch + schema together; use when many prompts share one output shape.
+    batch_structured_prompts = [
+        "Generate a JSON with the brand, model and car_type of the most iconic car from the 90's.",
+        "Generate a JSON with the brand, model and car_type of a famous Japanese sports car.",
+    ]
+    batch_structured_responses = engine.generate_structured_in_batch(
+        batch_structured_prompts, pydantic_model=CarDescription, enable_thinking=False
+    )
+    for i, resp in enumerate(batch_structured_responses):
+        print(f"Batch Structured Response {i+1}:", resp)
+        print(f"Batch Structured Response Type {i+1}: {type(resp)}")
+    # 6) Batch structured generation with `enable_thinking=True`.
+    #    Shows batch structured outputs with thinking; use for complex, multi-step tasks.
+    batch_structured_responses = engine.generate_structured_in_batch(
+        batch_structured_prompts, pydantic_model=CarDescription, enable_thinking=True
+    )
+    for i, resp in enumerate(batch_structured_responses):
+        print(f"Batch Structured Response {i+1}:", resp)
+        print(f"Batch Structured Response Type {i+1}: {type(resp)}")
+
+    # 7) Batch structured generation with different schemas per prompt.
+    #    Shows per-item schemas; use when each prompt needs a different output shape.
+    class MovieDescription(BaseModel):
+        title: str
+        year: int
+        genre: str
+
+    mixed_prompts = [
+        "Generate a JSON with the brand, model and car_type of the most iconic car from the 90's.",
+        "Generate a JSON with the title, year, and genre of a classic 90's sci-fi movie.",
+    ]
+    mixed_models = [CarDescription, MovieDescription]
+
+    mixed_responses = engine.generate_structured_in_batch_with_models(
+        mixed_prompts, mixed_models, enable_thinking=False
+    )
+    for i, resp in enumerate(mixed_responses):
+        print(f"Mixed Structured Response {i+1}:", resp)
+        print(f"Mixed Structured Response Type {i+1}: {type(resp)}")
+    # 8) Mixed-schema batch generation with `enable_thinking=True`.
+    #    Shows mixed schemas plus thinking; use when prompts vary and need reasoning.
+    mixed_responses = engine.generate_structured_in_batch_with_models(
+        mixed_prompts, mixed_models, enable_thinking=True
+    )
+    for i, resp in enumerate(mixed_responses):
+        print(f"Mixed Structured Response (Thinking) {i+1}:", resp)
+        print(f"Mixed Structured Response Type (Thinking) {i+1}: {type(resp)}")
+    
+    # 9) Structured generation with enum-constrained fields via Pydantic.
+    #    Shows constrained values; use to restrict outputs to a safe predefined set.
+    from pydantic import Field
+    from enum import Enum
+    class CarType(str, Enum):
+        sedan = "sedan"
+        suv = "suv"
+        coupe = "coupe"
+        convertible = "convertible"
+        hatchback = "hatchback"
+        wagon = "wagon"
+        van = "van"
+        truck = "truck"
+
+    class CarDescriptionWithEnum(BaseModel):
+        brand: str
+        model: str
+        car_type: CarType = Field(..., description="Type of the car from the predefined enum options.")
+
+    structured_response_enum = engine.generate_structured(
+        structured_prompt, pydantic_model=CarDescriptionWithEnum, enable_thinking=False
+    )
+    print("Structured Response with Enum:", structured_response_enum)
+    print(f"Structured Response with Enum Type: {type(structured_response_enum)}")
+
+    # 10) Structured generation with enum-constrained fields and `enable_thinking=True`.
+    #     Shows enum constraints plus reasoning; use for complex tasks needing safe outputs.
+    structured_response_enum = engine.generate_structured(
+        structured_prompt, pydantic_model=CarDescriptionWithEnum, enable_thinking=True
+    )
+    print("Structured Response with Enum (Thinking):", structured_response_enum)
+    print(f"Structured Response with Enum Type (Thinking): {type(structured_response_enum)}")
+
+    # 11) Testing extended context length.
+    #     Shows how to handle long texts and verify tokenization.
+    with open("tests/text_long.txt", "r") as f:
+        long_text = f.read()
+        # Take just the first 300,000 characters to ensure we are within the 131k token limit after tokenization, given that tokens can be shorter than characters.
+        long_text = long_text[:500000] + "... (truncated for testing)"
+    # long_prompt = "Summarize the following text: " + "Lorem ipsum " * 30000  # Long text to test extended context
+    long_prompt = "Summarize the following text: " + long_text  # Long text to test extended context
+    # Count tokens with the tokenizer to verify extended context handling
+    tokenized = engine.tokenizer(long_prompt, return_tensors="np")
+    print(f"Tokenized input length: {len(tokenized['input_ids'][0])} tokens")
+    long_response = engine.generate(long_prompt)
+    print("Long Response:", long_response)
+
+    long_prompt = "Read the following text: " + long_text + "Now, FORGET THE TEXT. Tell me a joke about Donald Trump."  # Test that the model can handle long context and then follow a simple instruction after it, which also tests that the rope scaling is working correctly and not just allowing more tokens but also properly forgetting old context as new tokens come in.
+    # Count tokens with the tokenizer to verify extended context handling
+    tokenized = engine.tokenizer(long_prompt, return_tensors="np")
+    print(f"Tokenized input length: {len(tokenized['input_ids'][0])} tokens")
+    long_response = engine.generate(long_prompt)
+    print("Long Response:", long_response)
+
+    class BookSummary(BaseModel):
+        title: str
+        main_characters: list[str]
+        summary: str
+        major_themes: list[str]
+    structured_long_response = engine.generate_structured(
+        long_text, pydantic_model=BookSummary, enable_thinking=True
+    )
+    print("Structured Long Response:", structured_long_response)

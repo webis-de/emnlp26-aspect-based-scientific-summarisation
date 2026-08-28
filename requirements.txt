@@ -1,0 +1,28 @@
+# Install a CUDA-compatible PyTorch build before installing vLLM when needed.
+torch
+vllm
+transformers
+datasets
+sentence-transformers
+pydantic
+openai
+python-dotenv
+tqdm
+
+# Evaluation and analysis
+bert-score
+rouge-score
+scikit-learn
+numpy
+pandas
+matplotlib
+seaborn
+requests
+jinja2
+lxml
+nltk
+spacy
+Pillow
+
+# PubMed and visual preprocessing
+paddleocr
